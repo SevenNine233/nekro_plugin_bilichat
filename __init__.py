@@ -1,30 +1,34 @@
 """
 NekroAgent BiliChat 插件
 
-复刻 nonebot-plugin-bilichat 的核心功能：
-- B站内容解析（视频、专栏、动态）
-- UP主订阅管理
-- 动态/直播推送（通过异步任务实现）
-
-依赖 bilichat-request 服务
+复刻 nonebot-plugin-bilichat 核心功能：
+- 独立 YAML 订阅配置
+- 定时轮询动态/直播
+- 动态/直播推送
+- 指令订阅管理（通过动态路由 API）
 """
 
 import asyncio
 import time
+from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from nekro_agent.api import core
-from nekro_agent.api.plugin import ConfigBase, ExtraField, NekroPlugin, SandboxMethodType
+import yaml
+from deepdiff import DeepDiff
+from fastapi import APIRouter, HTTPException, Query
+from nekro_agent.api import message
+from nekro_agent.api.plugin import ConfigBase, ExtraField, NekroPlugin
 from nekro_agent.api.schemas import AgentCtx
-from nekro_agent.services.plugin.task import AsyncTaskHandle, TaskCtl, task
-from pydantic import BaseModel, Field
+from nekro_agent.services.plugin.task import AsyncTaskHandle, task
+from pydantic import BaseModel, Field, computed_field
 
 # 插件元信息
 plugin = NekroPlugin(
     name="BiliChat",
     module_name="bilichat",
-    description="B站内容解析与UP主订阅推送插件，支持视频/专栏/动态解析、订阅管理、动态直播推送",
+    description="B站UP主订阅推送插件，支持动态/直播推送、订阅管理",
     version="1.0.0",
     author="SevenNine233",
     url="https://github.com/SevenNine233/nekro_plugin_bilichat",
@@ -35,127 +39,194 @@ plugin = NekroPlugin(
 # 数据模型
 # =====================
 
-class PushType:
-    """推送类型枚举"""
-    PUSH = "PUSH"        # 正常推送
-    AT_ALL = "AT_ALL"    # @全体成员
-    IGNORE = "IGNORE"    # 忽略
+class PushType(str, Enum):
+    """推送方式"""
+    AT_ALL = "AT_ALL"
+    PUSH = "PUSH"
+    IGNORE = "IGNORE"
 
 
-# 忽略的动态类型（广告、直播推荐等）
-IGNORED_DYNAMIC_TYPES = {
-    "DYNAMIC_TYPE_AD",           # 广告
-    "DYNAMIC_TYPE_LIVE",         # 直播预告
-    "DYNAMIC_TYPE_LIVE_RCMD",    # 直播推荐
-    "DYNAMIC_TYPE_BANNER",       # 横幅
+class DynamicType(str, Enum):
+    """动态类型"""
+    DYNAMIC_TYPE_AD = "DYNAMIC_TYPE_AD"
+    DYNAMIC_TYPE_APPLET = "DYNAMIC_TYPE_APPLET"
+    DYNAMIC_TYPE_ARTICLE = "DYNAMIC_TYPE_ARTICLE"
+    DYNAMIC_TYPE_AV = "DYNAMIC_TYPE_AV"
+    DYNAMIC_TYPE_BANNER = "DYNAMIC_TYPE_BANNER"
+    DYNAMIC_TYPE_COMMON_SQUARE = "DYNAMIC_TYPE_COMMON_SQUARE"
+    DYNAMIC_TYPE_COMMON_VERTICAL = "DYNAMIC_TYPE_COMMON_VERTICAL"
+    DYNAMIC_TYPE_COURSES = "DYNAMIC_TYPE_COURSES"
+    DYNAMIC_TYPE_DRAW = "DYNAMIC_TYPE_DRAW"
+    DYNAMIC_TYPE_FORWARD = "DYNAMIC_TYPE_FORWARD"
+    DYNAMIC_TYPE_LIVE = "DYNAMIC_TYPE_LIVE"
+    DYNAMIC_TYPE_LIVE_RCMD = "DYNAMIC_TYPE_LIVE_RCMD"
+    DYNAMIC_TYPE_MEDIALIST = "DYNAMIC_TYPE_MEDIALIST"
+    DYNAMIC_TYPE_MUSIC = "DYNAMIC_TYPE_MUSIC"
+    DYNAMIC_TYPE_NONE = "DYNAMIC_TYPE_NONE"
+    DYNAMIC_TYPE_PGC = "DYNAMIC_TYPE_PGC"
+    DYNAMIC_TYPE_WORD = "DYNAMIC_TYPE_WORD"
+
+
+# 忽略的动态类型
+DYNAMIC_IGNORE_TYPE = {
+    DynamicType.DYNAMIC_TYPE_AD,
+    DynamicType.DYNAMIC_TYPE_LIVE,
+    DynamicType.DYNAMIC_TYPE_LIVE_RCMD,
+    DynamicType.DYNAMIC_TYPE_BANNER,
+}
+
+# 默认动态推送配置
+DEFAULT_DYNAMIC_PUSH: Dict[DynamicType, PushType] = {
+    t: (PushType.IGNORE if t in DYNAMIC_IGNORE_TYPE else PushType.PUSH)
+    for t in DynamicType
 }
 
 
-class UPInfo(BaseModel):
+class UP(BaseModel):
     """UP主信息"""
-    uid: int
-    """UP主UID"""
-    uname: str = ""
-    """UP主用户名"""
-    nickname: str = ""
-    """自定义昵称"""
-    note: str = ""
-    """备注"""
-    live_push: str = PushType.PUSH
-    """直播推送方式"""
-    dynamic_push: str = PushType.PUSH
-    """动态推送方式"""
+    uid: int = Field(..., description="UP主UID")
+    uname: str = Field(default="", description="UP主B站用户名")
+    nickname: str = Field(default="", description="自定义昵称")
+    note: str = Field(default="", description="备注")
+    dynamic: Dict[str, str] = Field(
+        default_factory=lambda: {k.value: v.value for k, v in DEFAULT_DYNAMIC_PUSH.items()},
+        description="各种类型动态推送方式"
+    )
+    live: PushType = Field(default=PushType.PUSH, description="直播推送方式")
 
 
-class SubscriptionData(BaseModel):
-    """订阅数据"""
-    ups: Dict[int, UPInfo] = {}
-    """订阅的UP主列表 {uid: UPInfo}"""
+class UserInfo(BaseModel):
+    """用户订阅信息"""
+    chat_key: str = Field(..., description="会话标识")
+    subscribes: Dict[int, UP] = Field(default_factory=dict, description="订阅的UP主")
+
+    def add_subscription(self, uid: int, uname: str, nickname: str = "") -> None:
+        """添加订阅"""
+        if uid in self.subscribes:
+            self.subscribes[uid].uname = uname
+            if nickname:
+                self.subscribes[uid].nickname = nickname
+        else:
+            self.subscribes[uid] = UP(uid=uid, uname=uname, nickname=nickname)
+
+    def remove_subscription(self, uid: int) -> bool:
+        """移除订阅"""
+        if uid in self.subscribes:
+            del self.subscribes[uid]
+            return True
+        return False
 
 
-class PushState(BaseModel):
-    """推送状态"""
-    dynamic_offsets: Dict[int, int] = {}
-    """动态偏移量 {uid: last_dyn_id}"""
-    live_status: Dict[int, int] = {}
-    """直播状态 {uid: status} 0=未开播, 1=直播中"""
-    live_time: Dict[int, int] = {}
-    """直播开始时间 {uid: timestamp}"""
+class SubscribeConfig(BaseModel):
+    """订阅配置"""
+    dynamic_interval: int = Field(default=300, description="动态轮询间隔(秒)", ge=60)
+    live_interval: int = Field(default=60, description="直播轮询间隔(秒)", ge=30)
+    push_delay: int = Field(default=3, description="推送延迟(秒)", ge=0)
+    use_rich_media: bool = Field(default=True, description="使用富媒体消息")
+    users: Dict[str, UserInfo] = Field(default_factory=dict, description="用户订阅数据")
+
+
+class ApiConfig(BaseModel):
+    """API配置"""
+    url: str = Field(default="http://192.168.0.102:40432", description="bilichat-request API地址")
+    token: str = Field(default="", description="API Token")
+
+
+class BiliChatConfigFile(BaseModel):
+    """配置文件模型"""
+    version: str = Field(default="1.0.0", description="配置版本")
+    api: ApiConfig = Field(default_factory=ApiConfig, description="API配置")
+    subs: SubscribeConfig = Field(default_factory=SubscribeConfig, description="订阅配置")
 
 
 # =====================
-# 配置系统
+# 配置管理器
 # =====================
 
-@plugin.mount_config()
-class BiliChatConfig(ConfigBase):
-    """BiliChat 插件配置"""
+class ConfigManager:
+    """配置管理器"""
 
-    # API 配置
-    api_url: str = Field(
-        default="http://192.168.0.102:40432",
-        title="BiliChat API 地址",
-        description="bilichat-request 服务的 API 地址",
-        json_schema_extra=ExtraField(required=True).model_dump()
-    )
-    api_token: str = Field(
-        default="xY8rL2pQ9sN4wT7zK",
-        title="API Token",
-        description="bilichat-request 服务的访问令牌",
-        json_schema_extra=ExtraField(is_secret=True).model_dump()
-    )
+    _config: BiliChatConfigFile = BiliChatConfigFile()
+    _config_path: Optional[Path] = None
 
-    # 解析配置
-    parse_video: bool = Field(
-        default=True,
-        title="解析视频",
-        description="是否解析B站视频链接"
-    )
-    parse_dynamic: bool = Field(
-        default=True,
-        title="解析动态",
-        description="是否解析B站动态链接"
-    )
-    parse_column: bool = Field(
-        default=True,
-        title="解析专栏",
-        description="是否解析B站专栏链接"
-    )
-    screenshot_quality: int = Field(
-        default=75,
-        title="截图质量",
-        description="浏览器截图质量 (10-100)",
-        ge=10,
-        le=100
-    )
+    @classmethod
+    def get_config_path(cls) -> Path:
+        """获取配置文件路径"""
+        if cls._config_path is None:
+            cls._config_path = plugin.get_plugin_data_dir() / "config.yaml"
+        return cls._config_path
 
-    # 订阅推送配置
-    enable_push: bool = Field(
-        default=True,
-        title="启用推送",
-        description="是否启用动态和直播推送功能"
-    )
-    dynamic_interval: int = Field(
-        default=300,
-        title="动态轮询间隔",
-        description="动态检查间隔（秒），最小 60 秒",
-        ge=60
-    )
-    live_interval: int = Field(
-        default=60,
-        title="直播轮询间隔",
-        description="直播状态检查间隔（秒），最小 30 秒",
-        ge=30
-    )
-    use_rich_media: bool = Field(
-        default=True,
-        title="使用富媒体消息",
-        description="推送时是否发送图片，关闭则只发送纯文本"
-    )
+    @classmethod
+    def get(cls) -> BiliChatConfigFile:
+        """获取配置"""
+        return cls._config
 
+    @classmethod
+    def load(cls) -> BiliChatConfigFile:
+        """加载配置文件"""
+        config_path = cls.get_config_path()
+        
+        if not config_path.exists():
+            plugin.logger.info(f"[⚙️] 配置文件不存在，创建默认配置: {config_path}")
+            cls._config = BiliChatConfigFile()
+            cls.save()
+            return cls._config
+        
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            cls._config = BiliChatConfigFile.model_validate(data)
+            plugin.logger.success(f"[✅] 配置文件加载成功")
+            return cls._config
+        except Exception as e:
+            plugin.logger.error(f"[❌] 配置文件加载失败: {e}")
+            cls._config = BiliChatConfigFile()
+            return cls._config
 
-# 获取配置实例
-config: BiliChatConfig = plugin.get_config(BiliChatConfig)
+    @classmethod
+    def save(cls, log_diff: bool = True) -> None:
+        """保存配置文件"""
+        config_path = cls.get_config_path()
+        
+        # 获取旧配置用于比较
+        old_config = None
+        if log_diff and config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    old_data = yaml.safe_load(f) or {}
+                old_config = BiliChatConfigFile.model_validate(old_data)
+            except Exception:
+                pass
+        
+        # 保存新配置
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(cls._config.model_dump(mode="json"), f, allow_unicode=True, indent=2)
+        
+        # 日志变更
+        if log_diff and old_config:
+            diff = DeepDiff(
+                old_config.model_dump(mode="json"),
+                cls._config.model_dump(mode="json"),
+                ignore_order=True
+            )
+            if diff:
+                if "values_changed" in diff:
+                    for path, info in diff["values_changed"].items():
+                        plugin.logger.info(f"[⚙️] 修改配置项 {path}: {info['old_value']} --> {info['new_value']}")
+                if "dictionary_item_added" in diff:
+                    for path in diff["dictionary_item_added"]:
+                        plugin.logger.info(f"[🎉] 新增配置项: {path}")
+                if "dictionary_item_removed" in diff:
+                    for path in diff["dictionary_item_removed"]:
+                        plugin.logger.info(f"[♻️] 移除配置项: {path}")
+                plugin.logger.info("[💾] 配置已保存")
+
+    @classmethod
+    def set(cls, config: BiliChatConfigFile, log_diff: bool = True) -> None:
+        """设置配置"""
+        cls._config = config
+        cls.save(log_diff)
 
 
 # =====================
@@ -185,16 +256,15 @@ class BiliChatAPI:
             await self._client.aclose()
 
     async def _request(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
-        """发送HTTP请求"""
         client = await self._get_client()
         try:
             response = await client.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise Exception(f"API 请求失败: {e.response.status_code} - {e.response.text}")
+            raise Exception(f"API请求失败: {e.response.status_code}")
         except httpx.RequestError as e:
-            raise Exception(f"网络请求错误: {e}")
+            raise Exception(f"网络错误: {e}")
 
     async def _get(self, url: str, **kwargs) -> Dict[str, Any]:
         return await self._request("GET", url, **kwargs)
@@ -202,55 +272,26 @@ class BiliChatAPI:
     async def _post(self, url: str, **kwargs) -> Dict[str, Any]:
         return await self._request("POST", url, **kwargs)
 
-    # 内容解析 API
-    async def parse_content(self, bililink: str) -> Dict[str, Any]:
-        """解析B站内容（自动识别类型）"""
-        return await self._get("/content/", params={"bililink": bililink})
+    async def search_up(self, keyword: str, ps: int = 5) -> List[Dict[str, Any]]:
+        """搜索UP主"""
+        result = await self._get("/tools/search_up", params={"keyword": keyword, "ps": ps})
+        return result if isinstance(result, list) else [result]
 
-    async def parse_video(self, video_id: str, quality: int = 75) -> Dict[str, Any]:
-        """解析视频"""
-        return await self._get("/content/video", params={"video_id": video_id, "quality": quality})
+    async def get_live_status(self, uid: int) -> Dict[str, Any]:
+        """获取直播状态"""
+        return await self._get("/subs/live", params={"uid": uid})
+
+    async def get_live_status_batch(self, uids: List[int]) -> List[Dict[str, Any]]:
+        """批量获取直播状态"""
+        return await self._post("/subs/lives", json=uids)
+
+    async def get_dynamics(self, uid: int, offset: int = 0) -> List[Dict[str, Any]]:
+        """获取动态列表"""
+        return await self._get("/subs/dynamic", params={"uid": uid, "offset": offset})
 
     async def parse_dynamic(self, dynamic_id: str, quality: int = 75) -> Dict[str, Any]:
         """解析动态"""
         return await self._get("/content/dynamic", params={"dynamic_id": dynamic_id, "quality": quality})
-
-    async def parse_column(self, cvid: str, quality: int = 75) -> Dict[str, Any]:
-        """解析专栏"""
-        return await self._get("/content/column", params={"cvid": cvid, "quality": quality})
-
-    # 订阅 API
-    async def get_live_status(self, uid: int) -> Dict[str, Any]:
-        """获取单个UP主直播状态"""
-        return await self._get("/subs/live", params={"uid": uid})
-
-    async def get_live_status_batch(self, uids: List[int]) -> List[Dict[str, Any]]:
-        """批量获取UP主直播状态"""
-        return await self._post("/subs/lives", json=uids)
-
-    async def get_dynamics(self, uid: int, offset: int = 0) -> List[Dict[str, Any]]:
-        """获取UP主动态列表"""
-        return await self._get("/subs/dynamic", params={"uid": uid, "offset": offset})
-
-    # 工具 API
-    async def search_up(self, keyword: str, page_size: int = 5) -> List[Dict[str, Any]]:
-        """搜索UP主"""
-        result = await self._get("/tools/search_up", params={"keyword": keyword, "ps": page_size})
-        if isinstance(result, list):
-            return result
-        return [result]
-
-    async def b23_extract(self, b23_url: str) -> str:
-        """解析 b23 短链接"""
-        client = await self._get_client()
-        response = await client.get("/tools/b23_extract", params={"url": b23_url})
-        return response.text
-
-    async def b23_generate(self, url: str) -> str:
-        """生成 b23 短链接"""
-        client = await self._get_client()
-        response = await client.get("/tools/b23_generate", params={"url": url})
-        return response.text
 
     async def check_health(self) -> bool:
         """检查API健康状态"""
@@ -262,640 +303,478 @@ class BiliChatAPI:
 
 
 def get_api() -> BiliChatAPI:
-    """获取API客户端实例"""
-    return BiliChatAPI(config.api_url, config.api_token)
+    """获取API客户端"""
+    config = ConfigManager.get()
+    return BiliChatAPI(config.api.url, config.api.token)
 
 
 # =====================
-# 订阅管理器
+# 推送状态
 # =====================
 
-class SubscriptionManager:
-    """订阅管理器"""
+class PushState:
+    """推送状态管理"""
+    dynamic_offsets: Dict[int, int] = {}  # {uid: last_dyn_id}
+    live_status: Dict[int, int] = {}      # {uid: status}
+    live_time: Dict[int, int] = {}        # {uid: timestamp}
 
-    SUBSCRIPTION_KEY = "subscriptions"
-    PUSH_STATE_KEY = "push_state"
+    @classmethod
+    def get_dynamic_offset(cls, uid: int) -> int:
+        return cls.dynamic_offsets.get(uid, -1)
 
-    @staticmethod
-    async def get_subscriptions(chat_key: str) -> SubscriptionData:
-        """获取会话的订阅数据"""
-        data_str = await plugin.store.get(chat_key=chat_key, store_key=SubscriptionManager.SUBSCRIPTION_KEY)
-        if data_str:
-            return SubscriptionData.model_validate_json(data_str)
-        return SubscriptionData()
+    @classmethod
+    def set_dynamic_offset(cls, uid: int, offset: int) -> None:
+        cls.dynamic_offsets[uid] = offset
 
-    @staticmethod
-    async def save_subscriptions(chat_key: str, data: SubscriptionData):
-        """保存会话的订阅数据"""
-        await plugin.store.set(
-            chat_key=chat_key,
-            store_key=SubscriptionManager.SUBSCRIPTION_KEY,
-            value=data.model_dump_json()
-        )
+    @classmethod
+    def get_live_status(cls, uid: int) -> int:
+        return cls.live_status.get(uid, -1)
 
-    @staticmethod
-    async def get_push_state(chat_key: str) -> PushState:
-        """获取推送状态"""
-        data_str = await plugin.store.get(chat_key=chat_key, store_key=SubscriptionManager.PUSH_STATE_KEY)
-        if data_str:
-            return PushState.model_validate_json(data_str)
-        return PushState()
+    @classmethod
+    def set_live_status(cls, uid: int, status: int, live_time: int = 0) -> None:
+        cls.live_status[uid] = status
+        cls.live_time[uid] = live_time
 
-    @staticmethod
-    async def save_push_state(chat_key: str, state: PushState):
-        """保存推送状态"""
-        await plugin.store.set(
-            chat_key=chat_key,
-            store_key=SubscriptionManager.PUSH_STATE_KEY,
-            value=state.model_dump_json()
-        )
-
-    @staticmethod
-    async def add_subscription(chat_key: str, uid: int, uname: str, nickname: str = "") -> str:
-        """添加订阅"""
-        data = await SubscriptionManager.get_subscriptions(chat_key)
-        
-        if uid in data.ups:
-            up = data.ups[uid]
-            if nickname:
-                up.nickname = nickname
-            up.uname = uname
-        else:
-            data.ups[uid] = UPInfo(uid=uid, uname=uname, nickname=nickname)
-        
-        await SubscriptionManager.save_subscriptions(chat_key, data)
-        return f"已订阅 UP主 {nickname or uname} (UID: {uid})"
-
-    @staticmethod
-    async def remove_subscription(chat_key: str, uid: int) -> str:
-        """移除订阅"""
-        data = await SubscriptionManager.get_subscriptions(chat_key)
-        
-        if uid not in data.ups:
-            return f"未订阅 UID {uid} 的UP主"
-        
-        up = data.ups.pop(uid)
-        await SubscriptionManager.save_subscriptions(chat_key, data)
-        return f"已取消订阅 {up.nickname or up.uname} (UID: {uid})"
-
-    @staticmethod
-    async def list_subscriptions(chat_key: str) -> str:
-        """列出订阅"""
-        data = await SubscriptionManager.get_subscriptions(chat_key)
-        
-        if not data.ups:
-            return "当前会话未订阅任何UP主"
-        
-        lines = [f"共订阅 {len(data.ups)} 位UP主:"]
-        for i, (uid, up) in enumerate(data.ups.items(), 1):
-            name = up.nickname or up.uname
-            lines.append(f"{i}. {name} (UID: {uid})")
-        
-        return "\n".join(lines)
-
-    @staticmethod
-    async def set_push_type(chat_key: str, uid: int, push_type: str, content_type: str = "all") -> str:
-        """设置推送类型"""
-        data = await SubscriptionManager.get_subscriptions(chat_key)
-        
-        if uid not in data.ups:
-            return f"未订阅 UID {uid} 的UP主"
-        
-        up = data.ups[uid]
-        
-        if content_type in ("all", "live"):
-            up.live_push = push_type
-        if content_type in ("all", "dynamic"):
-            up.dynamic_push = push_type
-        
-        await SubscriptionManager.save_subscriptions(chat_key, data)
-        return f"已设置 {up.nickname or up.uname} 的推送方式为 {push_type}"
+    @classmethod
+    def get_live_time(cls, uid: int) -> int:
+        return cls.live_time.get(uid, 0)
 
 
 # =====================
 # 推送任务
 # =====================
 
-@plugin.mount_async_task("push_task")
-async def push_task(
-    handle: AsyncTaskHandle,
-    chat_key: str,
-) -> None:
-    """
-    推送异步任务
+async def push_message(chat_key: str, text: str) -> bool:
+    """发送推送消息"""
+    try:
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+        await message.send_text(chat_key, text, ctx)
+        return True
+    except Exception as e:
+        plugin.logger.error(f"[❌] 推送失败 ({chat_key}): {e}")
+        return False
+
+
+async def check_dynamic():
+    """检查动态"""
+    plugin.logger.trace("[Dynamic] 检查新动态")
+    config = ConfigManager.get()
     
-    负责定时检查订阅的UP主动态和直播状态，并推送通知
-    """
-    import asyncio
-    from nekro_agent.services.message_service import message_service
-    
-    plugin.logger.info(f"[BiliChat] 推送任务启动: {chat_key}")
+    if not config.subs.users:
+        return
     
     api = get_api()
+    
+    for chat_key, user in config.subs.users.items():
+        for uid, up in user.subscribes.items():
+            try:
+                # 检查是否忽略所有动态
+                if up.dynamic.get(DynamicType.DYNAMIC_TYPE_AV.value, PushType.PUSH.value) == PushType.IGNORE.value:
+                    # 检查是否所有动态类型都设置为忽略
+                    all_ignore = all(v == PushType.IGNORE.value for v in up.dynamic.values())
+                    if all_ignore:
+                        continue
+                
+                plugin.logger.debug(f"[Dynamic] 获取 UP {up.nickname or up.uname}({uid}) 动态")
+                
+                dynamics = await api.get_dynamics(uid)
+                if not dynamics:
+                    continue
+                
+                # 初始化偏移量
+                if PushState.get_dynamic_offset(uid) == -1:
+                    max_id = max(d["dyn_id"] for d in dynamics)
+                    PushState.set_dynamic_offset(uid, max_id)
+                    plugin.logger.info(f"[Dynamic] 初始化 UP {up.nickname or up.uname}({uid}) 动态偏移: {max_id}")
+                    continue
+                
+                # 获取新动态
+                last_offset = PushState.get_dynamic_offset(uid)
+                new_dynamics = sorted(
+                    [d for d in dynamics if d["dyn_id"] > last_offset],
+                    key=lambda x: x["dyn_id"]
+                )
+                
+                for dyn in new_dynamics:
+                    dyn_type = dyn.get("dyn_type", "")
+                    dyn_id = dyn["dyn_id"]
+                    
+                    # 检查是否忽略该类型
+                    if up.dynamic.get(dyn_type, PushType.PUSH.value) == PushType.IGNORE.value:
+                        plugin.logger.debug(f"[Dynamic] 忽略动态类型 {dyn_type}: {dyn_id}")
+                        PushState.set_dynamic_offset(uid, dyn_id)
+                        continue
+                    
+                    up_name = up.nickname or up.uname
+                    plugin.logger.info(f"[Dynamic] UP {up_name}({uid}) 发布新动态: {dyn_id}")
+                    
+                    # 构建推送消息
+                    b23 = ""
+                    if config.subs.use_rich_media:
+                        try:
+                            content = await api.parse_dynamic(str(dyn_id), 75)
+                            b23 = content.get("b23", "")
+                        except Exception as e:
+                            plugin.logger.warning(f"[Dynamic] 解析动态失败: {e}")
+                    
+                    push_type = up.dynamic.get(dyn_type, PushType.PUSH.value)
+                    at_all = "@全体成员 " if push_type == PushType.AT_ALL.value else ""
+                    
+                    msg = f"{at_all}📺 {up_name} 发布了新动态\n"
+                    if b23:
+                        msg += f"{b23}"
+                    else:
+                        msg += f"https://t.bilibili.com/{dyn_id}"
+                    
+                    await push_message(chat_key, msg)
+                    
+                    # 更新偏移量
+                    PushState.set_dynamic_offset(uid, dyn_id)
+                    
+                    # 推送延迟
+                    if config.subs.push_delay > 0:
+                        await asyncio.sleep(config.subs.push_delay)
+                
+            except Exception as e:
+                plugin.logger.error(f"[Dynamic] 检查 UP {uid} 动态失败: {e}")
+
+
+async def check_live():
+    """检查直播"""
+    plugin.logger.trace("[Live] 检查直播状态")
+    config = ConfigManager.get()
+    
+    if not config.subs.users:
+        return
+    
+    api = get_api()
+    
+    # 收集所有需要检查的UID
+    all_uids = set()
+    for user in config.subs.users.values():
+        for uid, up in user.subscribes.items():
+            if up.live != PushType.IGNORE:
+                all_uids.add(uid)
+    
+    if not all_uids:
+        return
+    
+    try:
+        lives = await api.get_live_status_batch(list(all_uids))
+        live_map = {lv["uid"]: lv for lv in lives}
+    except Exception as e:
+        plugin.logger.error(f"[Live] 获取直播状态失败: {e}")
+        return
+    
+    for chat_key, user in config.subs.users.items():
+        for uid, up in user.subscribes.items():
+            if up.live == PushType.IGNORE:
+                continue
+            
+            live = live_map.get(uid)
+            if not live:
+                continue
+            
+            live_status = live.get("live_status", 0)
+            prev_status = PushState.get_live_status(uid)
+            up_name = up.nickname or up.uname or live.get("uname", f"UID:{uid}")
+            
+            # 更新UP主名字
+            if live.get("uname") and live["uname"] != up.uname:
+                up.uname = live["uname"]
+                ConfigManager.save(log_diff=False)
+            
+            # 初始化状态
+            if prev_status == -1:
+                PushState.set_live_status(uid, live_status, live.get("live_time", 0))
+                plugin.logger.info(f"[Live] 初始化 UP {up_name}({uid}) 直播状态: {live_status}")
+                continue
+            
+            try:
+                # 开播通知
+                if live_status == 1 and prev_status != 1:
+                    title = live.get("title", "无标题")
+                    room_id = live.get("room_id", "")
+                    
+                    at_all = "@全体成员 " if up.live == PushType.AT_ALL else ""
+                    
+                    msg = f"{at_all}🔴 {up_name} 开播了!\n"
+                    msg += f"标题: {title}\n"
+                    msg += f"直播间: https://live.bilibili.com/{room_id}"
+                    
+                    plugin.logger.info(f"[Live] UP {up_name}({uid}) 开播: {title}")
+                    await push_message(chat_key, msg)
+                
+                # 下播通知
+                elif live_status != 1 and prev_status == 1:
+                    live_time = PushState.get_live_time(uid)
+                    duration = ""
+                    if live_time > 0:
+                        elapsed = int(time.time() - live_time)
+                        h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+                        if h > 0:
+                            duration = f"\n本次直播时长 {h}时{m}分{s}秒"
+                        elif m > 0:
+                            duration = f"\n本次直播时长 {m}分{s}秒"
+                        else:
+                            duration = f"\n本次直播时长 {s}秒"
+                    
+                    msg = f"⏹️ {up_name} 下播了{duration}"
+                    
+                    plugin.logger.info(f"[Live] UP {up_name}({uid}) 下播")
+                    await push_message(chat_key, msg)
+            
+            finally:
+                PushState.set_live_status(uid, live_status, live.get("live_time", 0))
+
+
+@plugin.mount_async_task("push_loop")
+async def push_loop_task(handle: AsyncTaskHandle):
+    """推送轮询任务"""
+    plugin.logger.info("[BiliChat] 推送任务启动")
+    
     last_dynamic_check = 0
     last_live_check = 0
     
     while not handle.is_cancelled:
         try:
-            # 获取订阅数据
-            sub_data = await SubscriptionManager.get_subscriptions(chat_key)
-            push_state = await SubscriptionManager.get_push_state(chat_key)
-            
-            if not sub_data.ups:
-                # 没有订阅，等待后重试
-                await asyncio.sleep(60)
-                continue
-            
+            config = ConfigManager.get()
             current_time = time.time()
             
-            # === 动态检查 ===
-            if current_time - last_dynamic_check >= config.dynamic_interval:
+            # 动态检查
+            if current_time - last_dynamic_check >= config.subs.dynamic_interval:
                 last_dynamic_check = current_time
-                plugin.logger.debug(f"[BiliChat] 检查动态: {chat_key}")
-                
-                for uid, up in sub_data.ups.items():
-                    if up.dynamic_push == PushType.IGNORE:
-                        continue
-                    
-                    if handle.is_cancelled:
-                        break
-                    
-                    try:
-                        dynamics = await api.get_dynamics(uid)
-                        
-                        if not dynamics:
-                            continue
-                        
-                        # 初始化偏移量
-                        if uid not in push_state.dynamic_offsets:
-                            push_state.dynamic_offsets[uid] = max(d["dyn_id"] for d in dynamics) if dynamics else 0
-                            await SubscriptionManager.save_push_state(chat_key, push_state)
-                            continue
-                        
-                        last_offset = push_state.dynamic_offsets[uid]
-                        new_dynamics = [d for d in dynamics if d["dyn_id"] > last_offset]
-                        
-                        for dyn in sorted(new_dynamics, key=lambda x: x["dyn_id"]):
-                            dyn_type = dyn.get("dyn_type", "")
-                            
-                            # 跳过忽略的类型
-                            if dyn_type in IGNORED_DYNAMIC_TYPES:
-                                continue
-                            
-                            dyn_id = dyn["dyn_id"]
-                            up_name = up.nickname or up.uname or f"UID:{uid}"
-                            
-                            # 推送动态
-                            push_text = f"📺 {up_name} 发布了新动态\n"
-                            
-                            if config.use_rich_media:
-                                try:
-                                    content = await api.parse_dynamic(str(dyn_id), config.screenshot_quality)
-                                    b23 = content.get("b23", "")
-                                    push_text += f"链接: {b23}"
-                                except Exception as e:
-                                    plugin.logger.warning(f"[BiliChat] 解析动态失败: {e}")
-                                    push_text += f"https://t.bilibili.com/{dyn_id}"
-                            else:
-                                push_text += f"https://t.bilibili.com/{dyn_id}"
-                            
-                            # 发送推送
-                            try:
-                                await message_service.push_system_message(
-                                    chat_key=chat_key,
-                                    agent_messages=push_text,
-                                    trigger_agent=False,
-                                )
-                                plugin.logger.info(f"[BiliChat] 推送动态: {up_name} - {dyn_id}")
-                            except Exception as e:
-                                plugin.logger.error(f"[BiliChat] 推送失败: {e}")
-                            
-                            # 更新偏移量
-                            push_state.dynamic_offsets[uid] = dyn_id
-                            await SubscriptionManager.save_push_state(chat_key, push_state)
-                            
-                            await asyncio.sleep(1)  # 避免频繁请求
-                        
-                    except Exception as e:
-                        plugin.logger.error(f"[BiliChat] 检查动态失败 (UID:{uid}): {e}")
+                await check_dynamic()
             
-            # === 直播检查 ===
-            if current_time - last_live_check >= config.live_interval:
+            # 直播检查
+            if current_time - last_live_check >= config.subs.live_interval:
                 last_live_check = current_time
-                plugin.logger.debug(f"[BiliChat] 检查直播: {chat_key}")
-                
-                live_uids = [uid for uid, up in sub_data.ups.items() if up.live_push != PushType.IGNORE]
-                
-                if live_uids:
-                    try:
-                        live_statuses = await api.get_live_status_batch(live_uids)
-                        live_map = {live["uid"]: live for live in live_statuses}
-                        
-                        for uid, up in sub_data.ups.items():
-                            if up.live_push == PushType.IGNORE:
-                                continue
-                            
-                            live_info = live_map.get(uid)
-                            if not live_info:
-                                continue
-                            
-                            live_status = live_info.get("live_status", 0)
-                            prev_status = push_state.live_status.get(uid, -1)
-                            
-                            up_name = up.nickname or up.uname or live_info.get("uname", f"UID:{uid}")
-                            
-                            # 开播通知: 之前未开播，现在直播中
-                            if live_status == 1 and prev_status != 1:
-                                title = live_info.get("title", "无标题")
-                                room_id = live_info.get("room_id", "")
-                                
-                                push_text = f"🔴 {up_name} 开播了!\n"
-                                push_text += f"标题: {title}\n"
-                                push_text += f"直播间: https://live.bilibili.com/{room_id}"
-                                
-                                try:
-                                    await message_service.push_system_message(
-                                        chat_key=chat_key,
-                                        agent_messages=push_text,
-                                        trigger_agent=False,
-                                    )
-                                    plugin.logger.info(f"[BiliChat] 推送开播: {up_name}")
-                                except Exception as e:
-                                    plugin.logger.error(f"[BiliChat] 推送开播失败: {e}")
-                            
-                            # 下播通知: 之前直播中，现在未开播
-                            elif live_status != 1 and prev_status == 1:
-                                push_text = f"⏹️ {up_name} 下播了"
-                                
-                                try:
-                                    await message_service.push_system_message(
-                                        chat_key=chat_key,
-                                        agent_messages=push_text,
-                                        trigger_agent=False,
-                                    )
-                                    plugin.logger.info(f"[BiliChat] 推送下播: {up_name}")
-                                except Exception as e:
-                                    plugin.logger.error(f"[BiliChat] 推送下播失败: {e}")
-                            
-                            # 更新状态
-                            push_state.live_status[uid] = live_status
-                            await SubscriptionManager.save_push_state(chat_key, push_state)
-                        
-                    except Exception as e:
-                        plugin.logger.error(f"[BiliChat] 检查直播失败: {e}")
+                await check_live()
             
-            # 等待下一次检查
-            await asyncio.sleep(min(config.live_interval, config.dynamic_interval) // 2)
+            # 等待
+            await asyncio.sleep(min(config.subs.dynamic_interval, config.subs.live_interval) // 4 + 10)
             
         except Exception as e:
             plugin.logger.error(f"[BiliChat] 推送任务异常: {e}")
             await asyncio.sleep(30)
     
-    plugin.logger.info(f"[BiliChat] 推送任务停止: {chat_key}")
+    plugin.logger.info("[BiliChat] 推送任务停止")
 
 
 # =====================
-# 沙盒方法 - 内容解析
+# 动态路由 API
 # =====================
 
-@plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
-    name="bilibili_parse",
-    description="解析B站链接内容，支持视频、专栏、动态等"
-)
-async def bilibili_parse(_ctx: AgentCtx, url: str) -> str:
-    """解析B站链接内容。
+@plugin.mount_router()
+def create_router() -> APIRouter:
+    """创建 API 路由"""
+    router = APIRouter()
 
-    自动识别并解析B站链接类型（视频、专栏、动态等），返回内容摘要。
+    @router.get("/", summary="API 首页")
+    async def api_home():
+        """返回 API 基本信息"""
+        return {
+            "name": plugin.name,
+            "version": plugin.version,
+            "endpoints": [
+                "GET / - API 首页",
+                "GET /sub - 查看订阅列表",
+                "POST /sub - 添加订阅",
+                "DELETE /sub - 取消订阅",
+                "PUT /push - 设置推送方式",
+                "GET /live/{uid} - 查询直播状态",
+            ]
+        }
 
-    Args:
-        url: B站链接，支持以下格式：
-            - 视频链接: https://www.bilibili.com/video/BVxxx 或 avxxx
-            - 动态链接: https://t.bilibili.com/xxx 或 dynamic/xxx
-            - 专栏链接: https://www.bilibili.com/read/cvxxx
-            - b23短链接: https://b23.tv/xxx
-
-    Returns:
-        str: 解析结果，包含内容类型、链接等信息。
-
-    Example:
-        bilibili_parse(url="https://www.bilibili.com/video/BV1xx")
-        bilibili_parse(url="https://t.bilibili.com/123456")
-    """
-    if not config.api_url:
-        return "错误: 未配置 BiliChat API 地址，请先在插件配置中设置"
-
-    try:
-        api = get_api()
+    @router.get("/sub", summary="查看订阅列表")
+    async def get_subscriptions(
+        chat_key: str = Query(..., description="会话标识")
+    ):
+        """查看指定会话的订阅列表"""
+        config = ConfigManager.get()
+        user = config.subs.users.get(chat_key)
         
-        content = await api.parse_content(url)
-        content_type = content.get("type", "unknown")
-        content_id = content.get("id", "")
-        b23_link = content.get("b23", "")
+        if not user or not user.subscribes:
+            return {"chat_key": chat_key, "count": 0, "subscribes": []}
         
-        type_names = {"video": "视频", "dynamic": "动态", "column": "专栏"}
-        type_name = type_names.get(content_type, content_type)
+        subs = []
+        for uid, up in user.subscribes.items():
+            subs.append({
+                "uid": uid,
+                "uname": up.uname,
+                "nickname": up.nickname,
+                "live_push": up.live.value,
+                "dynamic_push": up.dynamic.get(DynamicType.DYNAMIC_TYPE_AV.value, PushType.PUSH.value)
+            })
         
-        result = f"类型: {type_name}\n"
-        result += f"ID: {content_id}\n"
-        result += f"短链: {b23_link}"
+        return {
+            "chat_key": chat_key,
+            "count": len(subs),
+            "subscribes": subs
+        }
+
+    @router.post("/sub", summary="添加订阅")
+    async def add_subscription(
+        chat_key: str = Query(..., description="会话标识"),
+        keyword: str = Query(..., description="UP主昵称或UID"),
+        nickname: str = Query("", description="自定义昵称")
+    ):
+        """添加订阅"""
+        config = ConfigManager.get()
         
-        return result
-
-    except Exception as e:
-        plugin.logger.error(f"解析B站链接失败: {e}")
-        return f"解析失败: {e}"
-
-
-# =====================
-# 沙盒方法 - UP主搜索
-# =====================
-
-@plugin.mount_sandbox_method(
-    SandboxMethodType.TOOL,
-    name="bilibili_search_up",
-    description="搜索B站UP主"
-)
-async def bilibili_search_up(_ctx: AgentCtx, keyword: str, limit: int = 5) -> str:
-    """搜索B站UP主。
-
-    Args:
-        keyword: 搜索关键词（UP主昵称或UID）。
-        limit: 返回结果数量，默认5个，最多10个。
-
-    Returns:
-        str: 匹配的UP主列表。
-
-    Example:
-        bilibili_search_up(keyword="老番茄", limit=3)
-    """
-    if not config.api_url:
-        return "错误: 未配置 BiliChat API 地址"
-
-    try:
-        api = get_api()
-        limit = min(limit, 10)
-        results = await api.search_up(keyword, limit)
-        
-        if not results:
-            return f"未找到与 '{keyword}' 相关的UP主"
-        
-        lines = [f"找到 {len(results)} 位UP主:"]
-        for up in results:
-            lines.append(f"- {up['nickname']} (UID: {up['uid']})")
-        
-        return "\n".join(lines)
-
-    except Exception as e:
-        plugin.logger.error(f"搜索UP主失败: {e}")
-        return f"搜索失败: {e}"
-
-
-# =====================
-# 沙盒方法 - 订阅管理
-# =====================
-
-@plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
-    name="bilibili_subscribe",
-    description="订阅B站UP主，获取其动态和直播推送"
-)
-async def bilibili_subscribe(_ctx: AgentCtx, keyword: str, nickname: str = "") -> str:
-    """订阅B站UP主。
-
-    Args:
-        keyword: UP主昵称或UID。
-        nickname: 自定义昵称（可选）。
-
-    Returns:
-        str: 订阅结果信息。
-
-    Example:
-        bilibili_subscribe(keyword="老番茄")
-        bilibili_subscribe(keyword="546195", nickname="番茄")
-    """
-    if not config.api_url:
-        return "错误: 未配置 BiliChat API 地址"
-
-    try:
-        api = get_api()
-        results = await api.search_up(keyword, 1)
-        
-        if not results:
-            return f"未找到UP主: {keyword}"
-        
-        up = results[0]
-        uid = up["uid"]
-        uname = up["nickname"]
-        
-        result = await SubscriptionManager.add_subscription(
-            _ctx.from_chat_key, uid, uname, nickname
-        )
-        
-        # 确保推送任务在运行
-        if config.enable_push and not task.is_running("push_task", _ctx.from_chat_key):
-            await task.start(
-                task_type="push_task",
-                task_id=_ctx.from_chat_key,
-                chat_key=_ctx.from_chat_key,
-                plugin=plugin,
-                chat_key=_ctx.from_chat_key,
-            )
-        
-        return result
-
-    except Exception as e:
-        plugin.logger.error(f"订阅失败: {e}")
-        return f"订阅失败: {e}"
-
-
-@plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
-    name="bilibili_unsubscribe",
-    description="取消订阅B站UP主"
-)
-async def bilibili_unsubscribe(_ctx: AgentCtx, keyword: str) -> str:
-    """取消订阅B站UP主。
-
-    Args:
-        keyword: UP主昵称、UID或自定义昵称。使用 "all" 取消所有订阅。
-
-    Returns:
-        str: 取消订阅结果。
-
-    Example:
-        bilibili_unsubscribe(keyword="老番茄")
-        bilibili_unsubscribe(keyword="all")
-    """
-    try:
-        chat_key = _ctx.from_chat_key
-        data = await SubscriptionManager.get_subscriptions(chat_key)
-        
-        if keyword.lower() in ("all", "全部"):
-            count = len(data.ups)
-            data.ups.clear()
-            await SubscriptionManager.save_subscriptions(chat_key, data)
+        try:
+            api = get_api()
+            results = await api.search_up(keyword, 1)
             
-            # 停止推送任务
-            if task.is_running("push_task", chat_key):
-                await task.cancel("push_task", chat_key)
+            if not results:
+                raise HTTPException(status_code=404, detail=f"未找到UP主: {keyword}")
             
-            return f"已取消所有订阅（共 {count} 位UP主）"
+            up_info = results[0]
+            uid = up_info["uid"]
+            uname = up_info["nickname"]
+            
+            # 添加订阅
+            if chat_key not in config.subs.users:
+                config.subs.users[chat_key] = UserInfo(chat_key=chat_key)
+            
+            config.subs.users[chat_key].add_subscription(uid, uname, nickname)
+            ConfigManager.save()
+            
+            plugin.logger.info(f"[🎉] {chat_key} 订阅 UP {nickname or uname}({uid})")
+            
+            return {
+                "success": True,
+                "message": f"已订阅 UP {nickname or uname} (UID: {uid})",
+                "uid": uid,
+                "uname": uname,
+                "nickname": nickname
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            plugin.logger.error(f"[❌] 添加订阅失败: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.delete("/sub", summary="取消订阅")
+    async def remove_subscription(
+        chat_key: str = Query(..., description="会话标识"),
+        keyword: str = Query(..., description="UP主昵称、UID 或 'all'")
+    ):
+        """取消订阅"""
+        config = ConfigManager.get()
+        user = config.subs.users.get(chat_key)
         
-        if keyword.isdigit():
-            uid = int(keyword)
-            result = await SubscriptionManager.remove_subscription(chat_key, uid)
-        else:
-            for u, up in data.ups.items():
-                if keyword in (up.uname, up.nickname) or str(u) == keyword:
-                    result = await SubscriptionManager.remove_subscription(chat_key, u)
-                    break
-            else:
-                return f"未找到UP主: {keyword}"
+        if not user:
+            raise HTTPException(status_code=404, detail="该会话未订阅任何UP主")
         
-        # 如果没有订阅了，停止推送任务
-        data = await SubscriptionManager.get_subscriptions(chat_key)
-        if not data.ups and task.is_running("push_task", chat_key):
-            await task.cancel("push_task", chat_key)
+        if keyword.lower() == "all":
+            count = len(user.subscribes)
+            user.subscribes.clear()
+            ConfigManager.save()
+            plugin.logger.info(f"[♻️] {chat_key} 取消全部订阅 ({count})")
+            return {"success": True, "message": f"已取消全部订阅 ({count} 位UP主)"}
         
-        return result
-
-    except Exception as e:
-        plugin.logger.error(f"取消订阅失败: {e}")
-        return f"取消订阅失败: {e}"
-
-
-@plugin.mount_sandbox_method(
-    SandboxMethodType.TOOL,
-    name="bilibili_list_subscriptions",
-    description="查看当前会话的B站UP主订阅列表"
-)
-async def bilibili_list_subscriptions(_ctx: AgentCtx) -> str:
-    """查看当前会话的B站UP主订阅列表。"""
-    return await SubscriptionManager.list_subscriptions(_ctx.from_chat_key)
-
-
-@plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
-    name="bilibili_set_push_type",
-    description="设置UP主推送方式"
-)
-async def bilibili_set_push_type(
-    _ctx: AgentCtx, 
-    keyword: str, 
-    push_type: Literal["PUSH", "AT_ALL", "IGNORE"],
-    content_type: Literal["all", "live", "dynamic"] = "all"
-) -> str:
-    """设置UP主推送方式。
-
-    Args:
-        keyword: UP主昵称、UID或自定义昵称。
-        push_type: 推送方式：PUSH(正常推送)、AT_ALL(@全体)、IGNORE(不推送)
-        content_type: 设置范围：all(全部)、live(仅直播)、dynamic(仅动态)
-
-    Returns:
-        str: 设置结果。
-
-    Example:
-        bilibili_set_push_type(keyword="老番茄", push_type="AT_ALL", content_type="live")
-    """
-    try:
-        chat_key = _ctx.from_chat_key
-        data = await SubscriptionManager.get_subscriptions(chat_key)
-        
+        # 查找UP主
         uid = None
         if keyword.isdigit():
             uid = int(keyword)
         else:
-            for u, up in data.ups.items():
+            for u, up in user.subscribes.items():
                 if keyword in (up.uname, up.nickname) or str(u) == keyword:
                     uid = u
                     break
         
-        if uid is None or uid not in data.ups:
-            return f"未找到UP主: {keyword}"
+        if uid is None or uid not in user.subscribes:
+            raise HTTPException(status_code=404, detail=f"未找到UP主: {keyword}")
         
-        return await SubscriptionManager.set_push_type(chat_key, uid, push_type, content_type)
-
-    except Exception as e:
-        plugin.logger.error(f"设置推送方式失败: {e}")
-        return f"设置失败: {e}"
-
-
-# =====================
-# 沙盒方法 - 工具
-# =====================
-
-@plugin.mount_sandbox_method(
-    SandboxMethodType.TOOL,
-    name="bilibili_get_live_status",
-    description="获取UP主直播状态"
-)
-async def bilibili_get_live_status(_ctx: AgentCtx, uid: int) -> str:
-    """获取UP主直播状态。
-
-    Args:
-        uid: UP主的B站UID。
-
-    Returns:
-        str: 直播状态信息。
-
-    Example:
-        bilibili_get_live_status(uid=546195)
-    """
-    if not config.api_url:
-        return "错误: 未配置 BiliChat API 地址"
-
-    try:
-        api = get_api()
-        live = await api.get_live_status(uid)
+        up = user.subscribes[uid]
+        name = up.nickname or up.uname
+        user.remove_subscription(uid)
         
-        status_map = {0: "未开播", 1: "直播中", 2: "轮播中"}
-        status = live.get("live_status", 0)
+        # 清理空用户
+        if not user.subscribes:
+            del config.subs.users[chat_key]
         
-        result = f"UP主: {live.get('uname', '未知')} (UID: {uid})\n"
-        result += f"直播状态: {status_map.get(status, '未知')}\n"
+        ConfigManager.save()
+        plugin.logger.info(f"[♻️] {chat_key} 取消订阅 {name}({uid})")
         
-        if status == 1:
-            result += f"标题: {live.get('title', '无标题')}\n"
-            result += f"直播间: https://live.bilibili.com/{live.get('room_id')}\n"
-            result += f"在线: {live.get('online', 0)}"
+        return {"success": True, "message": f"已取消订阅 {name} (UID: {uid})"}
+
+    @router.put("/push", summary="设置推送方式")
+    async def set_push_type(
+        chat_key: str = Query(..., description="会话标识"),
+        keyword: str = Query(..., description="UP主昵称或UID"),
+        push_type: PushType = Query(..., description="推送方式"),
+        content_type: Literal["live", "dynamic", "all"] = Query("all", description="设置范围")
+    ):
+        """设置推送方式"""
+        config = ConfigManager.get()
+        user = config.subs.users.get(chat_key)
         
-        return result
+        if not user:
+            raise HTTPException(status_code=404, detail="该会话未订阅任何UP主")
+        
+        # 查找UP主
+        uid = None
+        if keyword.isdigit():
+            uid = int(keyword)
+        else:
+            for u, up in user.subscribes.items():
+                if keyword in (up.uname, up.nickname) or str(u) == keyword:
+                    uid = u
+                    break
+        
+        if uid is None or uid not in user.subscribes:
+            raise HTTPException(status_code=404, detail=f"未找到UP主: {keyword}")
+        
+        up = user.subscribes[uid]
+        name = up.nickname or up.uname
+        
+        if content_type in ("all", "live"):
+            up.live = push_type
+        if content_type in ("all", "dynamic"):
+            for dt in DynamicType:
+                if dt not in DYNAMIC_IGNORE_TYPE:
+                    up.dynamic[dt.value] = push_type.value
+        
+        ConfigManager.save()
+        plugin.logger.info(f"[⚙️] {chat_key} 设置 {name}({uid}) 推送方式: {push_type.value} ({content_type})")
+        
+        return {
+            "success": True,
+            "message": f"已设置 {name} 的{content_type}推送方式为 {push_type.value}"
+        }
 
-    except Exception as e:
-        plugin.logger.error(f"获取直播状态失败: {e}")
-        return f"获取失败: {e}"
+    @router.get("/live/{uid}", summary="查询直播状态")
+    async def get_live_status(uid: int):
+        """查询UP主直播状态"""
+        try:
+            api = get_api()
+            live = await api.get_live_status(uid)
+            
+            status_map = {0: "未开播", 1: "直播中", 2: "轮播中"}
+            status = live.get("live_status", 0)
+            
+            result = {
+                "uid": uid,
+                "uname": live.get("uname", "未知"),
+                "status": status,
+                "status_text": status_map.get(status, "未知")
+            }
+            
+            if status == 1:
+                result["title"] = live.get("title", "无标题")
+                result["room_id"] = live.get("room_id")
+                result["online"] = live.get("online", 0)
+                result["url"] = f"https://live.bilibili.com/{live.get('room_id')}"
+            
+            return result
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
-
-@plugin.mount_sandbox_method(
-    SandboxMethodType.TOOL,
-    name="bilibili_b23_generate",
-    description="生成B站b23短链接"
-)
-async def bilibili_b23_generate(_ctx: AgentCtx, url: str) -> str:
-    """生成B站b23短链接。
-
-    Args:
-        url: B站长链接。
-
-    Returns:
-        str: 生成的b23短链接。
-
-    Example:
-        bilibili_b23_generate(url="https://www.bilibili.com/video/BV1xx")
-    """
-    if not config.api_url:
-        return "错误: 未配置 BiliChat API 地址"
-
-    try:
-        api = get_api()
-        b23 = await api.b23_generate(url)
-        return f"短链接: {b23}"
-
-    except Exception as e:
-        plugin.logger.error(f"生成短链接失败: {e}")
-        return f"生成失败: {e}"
+    return router
 
 
 # =====================
@@ -905,32 +784,50 @@ async def bilibili_b23_generate(_ctx: AgentCtx, url: str) -> str:
 @plugin.mount_init_method()
 async def init_plugin():
     """插件初始化"""
-    plugin.logger.info(f"BiliChat 插件初始化中...")
-    plugin.logger.info(f"API 地址: {config.api_url}")
+    plugin.logger.info("[BiliChat] 插件初始化中...")
     
-    if config.api_url:
-        try:
-            api = get_api()
-            if await api.check_health():
-                plugin.logger.success("BiliChat API 连接正常")
-            else:
-                plugin.logger.warning("BiliChat API 连接失败，请检查配置")
-        except Exception as e:
-            plugin.logger.warning(f"BiliChat API 连接检查失败: {e}")
+    # 加载配置
+    config = ConfigManager.load()
+    plugin.logger.info(f"[BiliChat] API 地址: {config.api.url}")
     
-    plugin.logger.success("BiliChat 插件初始化完成")
+    # 检查API连接
+    try:
+        api = get_api()
+        if await api.check_health():
+            plugin.logger.success("[BiliChat] API 连接正常")
+        else:
+            plugin.logger.warning("[BiliChat] API 连接失败，请检查配置")
+    except Exception as e:
+        plugin.logger.warning(f"[BiliChat] API 连接检查失败: {e}")
+    
+    # 启动推送任务
+    if config.subs.users:
+        plugin.logger.info(f"[BiliChat] 发现 {len(config.subs.users)} 个会话的订阅数据，启动推送任务")
+        if not task.is_running("push_loop", "main"):
+            await task.start(
+                task_type="push_loop",
+                task_id="main",
+                chat_key="system",
+                plugin=plugin,
+            )
+    
+    plugin.logger.success("[BiliChat] 插件初始化完成")
 
 
 @plugin.mount_cleanup_method()
 async def cleanup_plugin():
     """插件清理"""
-    plugin.logger.info("BiliChat 插件资源清理中...")
+    plugin.logger.info("[BiliChat] 插件资源清理中...")
     
-    # 停止所有推送任务
-    await task.stop_all()
+    # 停止推送任务
+    if task.is_running("push_loop", "main"):
+        await task.cancel("push_loop", "main")
     
     # 关闭API客户端
-    api = get_api()
-    await api.close()
+    try:
+        api = get_api()
+        await api.close()
+    except Exception:
+        pass
     
-    plugin.logger.info("BiliChat 插件资源已清理")
+    plugin.logger.info("[BiliChat] 插件资源已清理")

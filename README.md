@@ -3,122 +3,134 @@
 [![License](https://img.shields.io/github/license/SevenNine233/nekro_plugin_bilichat)](LICENSE)
 [![NekroAgent](https://img.shields.io/badge/NekroAgent-Compatible-blue)](https://github.com/KroMiose/nekro-agent)
 
-B站内容解析与UP主订阅推送插件，复刻自 [nonebot-plugin-bilichat](https://github.com/Well233/nonebot-plugin-bilichat)。
+B站UP主订阅推送插件，复刻自 [nonebot-plugin-bilichat](https://github.com/Well233/nonebot-plugin-bilichat) 的订阅推送功能。
 
 ## 功能特性
 
-### 🔗 内容解析
-- 自动识别并解析B站链接（视频、动态、专栏）
-- 生成 b23 短链接
-- 支持配置解析开关和截图质量
+### 📋 YAML 配置
+- 独立 YAML 配置文件存储订阅数据
+- 配置变更自动检测与日志记录
+- 支持热重载
 
-### 📺 订阅管理
-- 订阅UP主获取动态和直播推送
-- 自定义UP主昵称
-- 灵活的推送方式配置（正常推送/@全体/忽略）
+### ⏰ 定时轮询
+- 动态轮询（默认 300 秒）
+- 直播轮询（默认 60 秒）
+- 异步任务后台运行
 
-### 🔴 动态推送
-- 自动检测UP主新动态并推送
-- 过滤广告、直播预告等类型
-- 可配置轮询间隔
+### 📺 推送功能
+- 动态推送（过滤广告、直播预告）
+- 直播开播/下播通知
+- 支持富媒体消息
 
-### 📺 直播推送
-- 开播/下播通知
-- 实时直播状态查询
-- 可配置轮询间隔
+### 🎛️ 推送方式
+- `PUSH` - 正常推送
+- `AT_ALL` - @全体成员
+- `IGNORE` - 不推送
+
+### 🔗 动态路由 API
+- 订阅/取消订阅
+- 查看订阅列表
+- 设置推送方式
+- 查询直播状态
 
 ## 依赖
 
 本插件依赖 [bilichat-request](https://github.com/Well233/bilichat-request) 服务。
 
-请先部署 bilichat-request 服务，然后在插件配置中填写 API 地址和 Token。
-
 ## 安装
 
-将插件目录放入 NekroAgent 的插件目录中，或通过 WebUI 安装。
+将插件目录放入 NekroAgent 的插件目录中。
 
 ## 配置
 
+配置文件位于 `{plugin_data_dir}/config.yaml`：
+
+```yaml
+version: '1.0.0'
+api:
+  url: http://192.168.0.102:40432
+  token: your_token_here
+subs:
+  dynamic_interval: 300
+  live_interval: 60
+  push_delay: 3
+  use_rich_media: true
+  users:
+    telegram:123456:
+      chat_key: telegram:123456
+      subscribes:
+        546195:
+          uid: 546195
+          uname: 老番茄
+          nickname: 番茄
+          live: PUSH
+          dynamic:
+            DYNAMIC_TYPE_AV: PUSH
+            DYNAMIC_TYPE_DRAW: PUSH
+            DYNAMIC_TYPE_AD: IGNORE
+```
+
+### 配置项说明
+
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| api_url | string | `http://192.168.0.102:40432` | bilichat-request API 地址 |
-| api_token | string | - | API 访问令牌 |
-| parse_video | bool | `true` | 是否解析视频链接 |
-| parse_dynamic | bool | `true` | 是否解析动态链接 |
-| parse_column | bool | `true` | 是否解析专栏链接 |
-| screenshot_quality | int | `75` | 截图质量 (10-100) |
-| enable_push | bool | `true` | 是否启用推送功能 |
-| dynamic_interval | int | `300` | 动态轮询间隔（秒） |
-| live_interval | int | `60` | 直播轮询间隔（秒） |
-| use_rich_media | bool | `true` | 推送时是否发送图片 |
+| api.url | string | `http://192.168.0.102:40432` | bilichat-request API 地址 |
+| api.token | string | - | API Token |
+| subs.dynamic_interval | int | `300` | 动态轮询间隔（秒） |
+| subs.live_interval | int | `60` | 直播轮询间隔（秒） |
+| subs.push_delay | int | `3` | 推送延迟（秒） |
+| subs.use_rich_media | bool | `true` | 使用富媒体消息 |
 
-## 使用方法
+## API 端点
 
-### 内容解析
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| GET | `/plugins/SevenNine233.bilichat/` | API 首页 |
+| GET | `/plugins/SevenNine233.bilichat/sub` | 查看订阅列表 |
+| POST | `/plugins/SevenNine233.bilichat/sub` | 添加订阅 |
+| DELETE | `/plugins/SevenNine233.bilichat/sub` | 取消订阅 |
+| PUT | `/plugins/SevenNine233.bilichat/push` | 设置推送方式 |
+| GET | `/plugins/SevenNine233.bilichat/live/{uid}` | 查询直播状态 |
 
-```
-解析这个视频：https://www.bilibili.com/video/BV1xx...
-```
+### 使用示例
 
-### 订阅UP主
-
-```
-订阅UP主老番茄
-订阅UP主546195，昵称番茄
-```
-
-### 查看订阅
-
-```
-查看B站订阅列表
+**添加订阅**
+```bash
+curl -X POST "http://localhost:8080/plugins/SevenNine233.bilichat/sub?chat_key=telegram:123456&keyword=老番茄&nickname=番茄"
 ```
 
-### 取消订阅
-
-```
-取消订阅老番茄
-取消订阅全部
+**查看订阅**
+```bash
+curl "http://localhost:8080/plugins/SevenNine233.bilichat/sub?chat_key=telegram:123456"
 ```
 
-### 设置推送方式
-
-```
-设置老番茄的直播推送方式为@全体
-设置546195的动态推送方式为忽略
+**取消订阅**
+```bash
+curl -X DELETE "http://localhost:8080/plugins/SevenNine233.bilichat/sub?chat_key=telegram:123456&keyword=老番茄"
 ```
 
-### 查询直播状态
+**设置推送方式**
+```bash
+curl -X PUT "http://localhost:8080/plugins/SevenNine233.bilichat/push?chat_key=telegram:123456&keyword=老番茄&push_type=AT_ALL&content_type=live"
+```
+
+**查询直播状态**
+```bash
+curl "http://localhost:8080/plugins/SevenNine233.bilichat/live/546195"
+```
+
+## 日志格式
 
 ```
-查询546195的直播状态
+[BiliChat] 插件初始化中...
+[✅] 配置文件加载成功
+[BiliChat] API 地址: http://192.168.0.102:40432
+[✅] BiliChat API 连接正常
+[🎉] telegram:123456 订阅 UP 老番茄(546195)
+[Dynamic] UP 老番茄(546195) 发布新动态: 123456789
+[Live] UP 老番茄(546195) 开播: 新视频发布
+[♻️] telegram:123456 取消订阅 老番茄(546195)
 ```
-
-## API 方法
-
-| 方法名 | 类型 | 说明 |
-|--------|------|------|
-| `bilibili_parse` | AGENT | 解析B站链接内容 |
-| `bilibili_search_up` | TOOL | 搜索B站UP主 |
-| `bilibili_subscribe` | AGENT | 订阅UP主 |
-| `bilibili_unsubscribe` | AGENT | 取消订阅 |
-| `bilibili_list_subscriptions` | TOOL | 查看订阅列表 |
-| `bilibili_set_push_type` | AGENT | 设置推送方式 |
-| `bilibili_get_live_status` | TOOL | 获取直播状态 |
-| `bilibili_b23_generate` | TOOL | 生成短链接 |
-
-## 推送方式说明
-
-| 方式 | 说明 |
-|------|------|
-| `PUSH` | 正常推送 |
-| `AT_ALL` | 推送时@全体成员（需要权限） |
-| `IGNORE` | 不推送 |
-
-## 开发
-
-基于 NekroAgent 插件开发框架开发。
-
-参考文档：[NekroAgent 插件开发指南](https://docs.nekroagent.com/docs/04_plugin_dev/00_introduction)
 
 ## 致谢
 
