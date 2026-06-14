@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from .subs_manager import SubsManager
 from .models import PushType, UP, SubscriptionsData
 
-router = APIRouter(prefix="/bilichat", tags=["Bilichat WebUI"])
+router = APIRouter(prefix="", tags=["Bilichat WebUI"])
 
 
 # --- 请求/响应模型 ---
