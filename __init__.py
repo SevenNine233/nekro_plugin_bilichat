@@ -37,48 +37,6 @@ plugin = NekroPlugin(
 )
 
 
-# ==================== 配置 ====================
-
-@plugin.mount_config()
-class BilichatConfig(ConfigBase):
-    """B站推送插件配置"""
-
-    API_URL: str = Field(
-        default="http://192.168.1.102:40432",
-        title="bilichat-request API 地址",
-        description="bilichat-request 服务的地址",
-    )
-    API_TOKEN: str = Field(
-        default="xY8rL2pQ9sN4wT7zK",
-        title="API Token",
-        description="bilichat-request 的 API Token",
-    )
-    LIVE_INTERVAL: int = Field(
-        default=60,
-        title="直播检查间隔(秒)",
-        description="每隔多少秒检查一次已订阅 UP 的直播状态",
-        ge=10,
-    )
-    DYNAMIC_INTERVAL: int = Field(
-        default=300,
-        title="动态检查间隔(秒)",
-        description="每隔多少秒检查一次已订阅 UP 的新动态",
-        ge=30,
-    )
-    BROWSER_SHOT_QUALITY: int = Field(
-        default=75,
-        title="动态截图质量",
-        description="动态截图质量 (10-100)",
-        ge=10,
-        le=100,
-    )
-    USE_RICH_MEDIA: bool = Field(
-        default=True,
-        title="使用富文本推送",
-        description="推送时是否发送富文本消息（包含图片等多媒体内容），若关闭则只发送纯文本",
-    )
-
-
 # 获取配置实例
 config: BilichatConfig = plugin.get_config(BilichatConfig)
 
