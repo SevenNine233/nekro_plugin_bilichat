@@ -1,101 +1,76 @@
-# NekroAgent 插件模板
+# nekro_plugin_bilichat
 
-> 一个帮助开发者快速创建 NekroAgent 插件的模板仓库。
+> NekroAgent B站直播/动态推送插件，复刻 nonebot-plugin-bilichat 核心功能。
 
-## 🚀 快速开始
+## 功能
 
-### 1. 使用模板创建仓库
+- **直播推送**：订阅 UP 主后，自动推送开播/下播通知
+- **动态推送**：自动推送 UP 主的新动态（图文、转发、视频投稿等）
+- **AT 全体**：支持对特定 UP 的直播或动态开启 AT 全体成员
+- **WebUI 管理**：提供可视化管理界面，可查看/管理订阅、修改推送配置
+- **富文本推送**：开播推送封面图，动态推送截图
 
-1. 点击本仓库页面上的 "Use this template" 按钮
-2. 输入你的插件仓库名称，推荐命名格式：`nekro-plugin-[你的插件包名]`
-3. 选择公开或私有仓库
-4. 点击 "Create repository from template" 创建你的插件仓库
+## 配置说明
 
-### 2. 克隆你的插件仓库
+### bilichat-request API
 
-```bash
-git clone https://github.com/你的用户名/你的插件仓库名.git
-cd 你的插件仓库名
-```
+插件依赖 [bilichat-request](https://github.com/KroMiose/bilichat-request) 提供 B站 API 数据。
+部署 bilichat-request 后，在插件配置中设置 API 地址和 Token。
 
-### 3. 安装依赖
+### 插件配置项
 
-```bash
-# 安装 uv 包管理工具
-curl -LsSf https://astral.sh/uv/install.sh | sh
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| API_URL | http://192.168.1.102:40432 | bilichat-request 服务地址 |
+| API_TOKEN | - | API 访问 Token |
+| LIVE_INTERVAL | 60 | 直播状态检查间隔（秒） |
+| DYNAMIC_INTERVAL | 300 | 动态检查间隔（秒） |
+| BROWSER_SHOT_QUALITY | 75 | 动态截图质量 (10-100) |
+| USE_RICH_MEDIA | true | 是否使用富文本推送（含图片） |
 
-# 根据指引安装 uv 后打开新的终端检查 uv 是否安装成功
-uv --version
+## 使用命令
 
-# 同步安装所有依赖（自动创建虚拟环境）
-uv sync
-```
+所有命令以 /bilichat 为前缀，在 QQ 群/频道中使用：
 
-## 📝 插件开发指南
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| /bilichat sub <名称> | 订阅 UP 主 | /bilichat sub 泠鸢yousa |
+| /bilichat unsub <名称/UID> | 取消订阅 | /bilichat unsub 泠鸢yousa |
+| /bilichat unsub all | 取消全部订阅 | /bilichat unsub all |
+| /bilichat check | 查看当前频道订阅 | /bilichat check |
+| /bilichat atall <名称> live on | 开启直播 AT 全体 | /bilichat atall 泠鸢yousa live on |
+| /bilichat atall <名称> live off | 关闭直播 AT 全体 | /bilichat atall 泠鸢yousa live off |
 
-### 插件结构
+## WebUI 管理界面
 
-一个标准的 NekroAgent 插件需要在 `__init__.py` 中提供一个 `plugin` 实例，这是插件的核心，用于注册插件功能和配置。
+访问 /plugins/nekro_plugin_bilichat/bilichat/ 打开管理面板。
 
-```python
-# 示例插件结构
-plugin = NekroPlugin(
-    name="你的插件名称",  # 插件显示名称
-    module_name="plugin_module_name",  # 插件模块名 (在NekroAI社区需唯一)
-    description="插件描述",  # 插件功能简介
-    version="1.0.0",  # 插件版本
-    author="你的名字",  # 作者信息
-    url="https://github.com/你的用户名/你的插件仓库名",  # 插件仓库链接
-)
-```
+提供以下功能：
+- 添加/删除订阅
+- 查看所有频道的订阅状态
+- 修改推送配置
+- 查看 UP 主播运行状态
 
-### 开发功能
+## 推送消息格式
 
-1. **配置插件参数**：使用 `@plugin.mount_config()` 装饰器创建可配置参数
+开播: {主播名称} 开播了: {标题} + 封面图 + 直播链接
+下播: {主播名称} 下播了 + 直播时长
+动态: {主播名称} 发布了新动态 + 截图 + 短链接
 
-```python
-@plugin.mount_config()
-class MyPluginConfig(ConfigBase):
-    """插件配置说明"""
+> 若关闭富文本推送，则不发送图片，只发送纯文本。
 
-    API_KEY: str = Field(
-        default="",
-        title="API密钥",
-        description="第三方服务的API密钥",
-    )
-```
+## 数据存储
 
-2. **添加沙盒方法**：使用 `@plugin.mount_sandbox_method()` 添加 AI 可调用的函数
+订阅数据: {DATA_DIR}/plugins/nekro_plugin_bilichat/subscriptions.json
 
-```python
-@plugin.mount_sandbox_method(SandboxMethodType.AGENT, name="函数名称", description="函数功能描述")
-async def my_function(_ctx: AgentCtx, param1: str) -> str:
-    """实现插件功能的具体逻辑"""
-    return f"处理结果: {param1}"
-```
+## 依赖
 
-3. **资源清理**：使用 `@plugin.mount_cleanup_method()` 添加资源清理函数
+- nekro-agent >= 2.0.0
+- httpx >= 0.27.0
+- pydantic >= 2.0.0
+- fastapi >= 0.104.0
+- [bilichat-request](https://github.com/KroMiose/bilichat-request)（独立部署）
 
-```python
-@plugin.mount_cleanup_method()
-async def clean_up():
-    """清理资源，如数据库连接等"""
-    logger.info("资源已清理")
-```
-
-## 📦 插件发布
-
-完成开发后，你可以：
-
-1. 提交到 GitHub 仓库
-2. 发布到 NekroAI 云社区共享给所有用户
-
-## 🔍 更多资源
-
-- [NekroAgent 官方文档](https://doc.nekro.ai/)
-- [插件开发详细指南](https://doc.nekro.ai/docs/04_plugin_dev/intro.html)
-- [社区交流群](https://qm.qq.com/q/hJlRwD17Ae)：636925153
-
-## 📄 许可证
+## 许可
 
 MIT
