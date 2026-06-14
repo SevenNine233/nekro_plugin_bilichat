@@ -15,7 +15,7 @@ from nekro_agent.api.plugin import (
     CommandPermission,
     CmdCtl,
 )
-from nekro_agent.services.command.schemas import CommandExecutionContext
+from nekro_agent.services.command.schemas import Arg, CommandExecutionContext
 
 from pydantic import Field
 
@@ -127,7 +127,7 @@ bilichat_group = plugin.mount_command_group(
     description="订阅 UP 主",
     usage="/bilichat sub <UP名称>",
 )
-async def cmd_sub(context: CommandExecutionContext, raw_args: str = ""):
+async def cmd_sub(context: CommandExecutionContext, raw_args: str = Arg(greedy=True, default="")):
     """订阅 UP 主"""
     keyword = raw_args.strip()
     if not keyword:
@@ -154,7 +154,7 @@ async def cmd_sub(context: CommandExecutionContext, raw_args: str = ""):
     description="取消订阅 UP 主",
     usage="/bilichat unsub <UP名称/UID> 或 /bilichat unsub all",
 )
-async def cmd_unsub(context: CommandExecutionContext, raw_args: str = ""):
+async def cmd_unsub(context: CommandExecutionContext, raw_args: str = Arg(greedy=True, default="")):
     """取消订阅 UP 主"""
     keyword = raw_args.strip().lower()
     if not keyword:
@@ -190,7 +190,7 @@ async def cmd_unsub(context: CommandExecutionContext, raw_args: str = ""):
     description="查看当前频道订阅列表",
     usage="/bilichat check",
 )
-async def cmd_check(context: CommandExecutionContext, raw_args: str = ""):
+async def cmd_check(context: CommandExecutionContext, raw_args: str = Arg(greedy=True, default="")):
     """查看订阅列表"""
     chat_key = context.chat_key
     subs = subs_manager.get_subscriptions(chat_key)
@@ -209,7 +209,7 @@ async def cmd_check(context: CommandExecutionContext, raw_args: str = ""):
     description="设置 UP 的 AT 全体",
     usage="/bilichat atall <UP名称> <live|动态类型> <on|off>",
 )
-async def cmd_atall(context: CommandExecutionContext, raw_args: str = ""):
+async def cmd_atall(context: CommandExecutionContext, raw_args: str = Arg(greedy=True, default="")):
     """设置 AT 全体"""
     parts = raw_args.strip().split()
     if len(parts) != 3:
